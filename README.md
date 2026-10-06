@@ -23,6 +23,8 @@ Logs: `logs/trading.log`.
 
 ## Notes
 - Entries: candle opens 09:15-15:20 IST. EOD square-off at 15:25 IST (timer-driven in live).
+- Live trading stops for the IST week after estimated net P&L (realized plus open-position P&L, less configured costs) reaches `WEEKLY_PROFIT_TARGET` points (default 100, about ₹7,500 at qty 75); open positions are closed and no new trades are opened until Monday. The weekly P&L is persisted in `output/weekly-pnl.json`. Set `WEEKLY_PROFIT_TARGET` to change the limit.
+- Live P&L uses observed market prices and configured `COST_PER_TRADE`; it is an estimate because the order API response does not supply the actual fill price here.
 - Signal exits fire on candle close; backtest fills at the close, live at the next tick.
 - A setup on the same candle that triggers an exit is ignored.
 - Expired futures contracts need their specific symbol for backtests; update SYMBOL monthly.

@@ -5,21 +5,30 @@ const logger = require('./logger');
 const VwapBandStrategy = require('./strategy');
 const { createClient, fetchCandles } = require('./fyers');
 const { fmt, dayKey, minuteOfDay } = require('./time');
+const WeeklyProfitGuard = require('./weekly-profit');
 
 function simulate(candles, options = {}) {
   const strat = new VwapBandStrategy(options);
   const qty = options.qty ?? cfg.qty;
   const slip = options.slippagePoints ?? cfg.slippagePoints;
   const cost = options.costPerTrade ?? cfg.costPerTrade;
+  const weeklyProfit = new WeeklyProfitGuard({
+    target: options.weeklyProfitTarget ?? cfg.weeklyProfitTarget,
+    initialTs: candles[0]?.ts ?? Math.floor(Date.now() / 1000),
+  });
   const trades = [];
-  let open = null;
+  const opens = { LONG: null, SHORT: null };
 
-  const exit = (action, price) => {
+  const exit = (action, price, forceClose = true) => {
+    const open = opens[action.side];
+    if (!open) return;
     const dir = open.side === 'LONG' ? 1 : -1;
     const exitPrice = price - dir * slip;
     const points = (exitPrice - open.entryPrice) * dir;
     trades.push({
       side: open.side,
+      entryTs: open.entryTs,
+      exitTs: action.ts,
       entryTime: fmt(open.entryTs),
       entryPrice: open.entryPrice,
       triggerOpen: open.triggerOpen,
@@ -32,35 +41,72 @@ function simulate(candles, options = {}) {
     });
     strat.applyFill(action, exitPrice);
     logger.info(`[BT] EXIT ${open.side} ${action.reason} @ ${exitPrice} pnl=${points.toFixed(2)}pts`);
-    open = null;
+    opens[action.side] = null;
+    weeklyProfit.record(points - cost / qty, action.ts);
+    if (forceClose && weeklyProfit.isLocked(action.ts)) {
+      for (const side of ['LONG', 'SHORT']) {
+        if (opens[side]) {
+          exit({ type: 'EXIT', side, reason: 'WEEKLY_TARGET', ts: action.ts }, price, false);
+        }
+      }
+    }
+  };
+
+  const estimateOpenPnl = (price) => ['LONG', 'SHORT'].reduce((total, side) => {
+    const open = opens[side];
+    if (!open) return total;
+    const direction = open.side === 'LONG' ? 1 : -1;
+    return total + (price - open.entryPrice) * direction - cost / qty;
+  }, 0);
+
+  const closeAtWeeklyTarget = (price, ts) => {
+    if (!weeklyProfit.checkTarget(estimateOpenPnl(price), ts)) return;
+    for (const side of ['LONG', 'SHORT']) {
+      if (opens[side]) exit({ type: 'EXIT', side, reason: 'WEEKLY_TARGET', ts }, price);
+    }
+  };
+
+  const handle = (a) => {
+    if (weeklyProfit.isLocked(a.ts) && (a.type === 'ENTER' || a.type === 'SETUP')) {
+      strat.resetMemory();
+      return;
+    }
+    if (a.type === 'ENTER') {
+      const dir = a.side === 'LONG' ? 1 : -1;
+      const price = a.price + dir * slip;
+      strat.applyFill(a, price);
+      opens[a.side] = { ...strat.state[a.side].position };
+      logger.info(`[BT] ENTRY ${a.side} @ ${price} (${fmt(a.ts)})`);
+    } else if (a.type === 'EXIT') {
+      exit(a, a.price);
+    } else if (a.type === 'SETUP') {
+      logger.info(`[BT] SETUP ${a.side} ${fmt(a.ts)} open=${a.triggerOpen} close=${a.triggerClose}`);
+    }
   };
 
   let prev = null;
   for (const c of candles) {
-    // day rolled over with an open position (missing EOD candle): flatten at last known close
-    if (open && prev && dayKey(prev.ts) !== dayKey(c.ts)) {
-      exit({ type: 'EXIT', reason: 'EOD', ts: prev.ts }, prev.close);
+    weeklyProfit.isLocked(c.ts);
+    // day rolled over with open positions (missing EOD candle): flatten at last known close
+    if (!options.holdOvernight && prev && dayKey(prev.ts) !== dayKey(c.ts)) {
+      for (const side of ['LONG', 'SHORT']) {
+        if (opens[side]) exit({ type: 'EXIT', side, reason: 'EOD', ts: prev.ts }, prev.close);
+      }
     }
 
-    const a = strat.onOpen({ ts: c.ts, open: c.open });
-    if (a?.type === 'ENTER') {
-      const dir = a.side === 'LONG' ? 1 : -1;
-      const price = a.price + dir * slip;
-      strat.applyFill(a, price);
-      open = { ...strat.position };
-      logger.info(`[BT] ENTRY ${a.side} @ ${price} (${fmt(a.ts)})`);
-    } else if (a?.type === 'EXIT') {
-      exit(a, a.price);
-    }
-
-    const b = strat.onClose(c);
-    if (b?.type === 'SETUP') logger.info(`[BT] SETUP ${b.side} ${fmt(b.ts)} open=${b.triggerOpen} close=${b.triggerClose}`);
-    else if (b?.type === 'EXIT') exit(b, b.price);
+    closeAtWeeklyTarget(c.open, c.ts);
+    strat.onOpen({ ts: c.ts, open: c.open }).forEach(handle);
+    strat.onClose(c).forEach(handle);
+    closeAtWeeklyTarget(c.close, c.ts);
+    if (weeklyProfit.isLocked(c.ts)) strat.resetMemory();
 
     prev = c;
   }
-  if (open && prev) exit({ type: 'EXIT', reason: 'END_OF_DATA', ts: prev.ts }, prev.close);
+  for (const side of ['LONG', 'SHORT']) {
+    if (opens[side] && prev) exit({ type: 'EXIT', side, reason: 'END_OF_DATA', ts: prev.ts }, prev.close);
+  }
 
+  trades.sort((a, b) => a.entryTs - b.entryTs);
   return { trades, summary: summarize(trades, qty) };
 }
 

@@ -12,10 +12,12 @@ module.exports = {
   dryRun: String(process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false',
   slippagePoints: num(process.env.SLIPPAGE_POINTS, 0),
   costPerTrade: num(process.env.COST_PER_TRADE, 0), // flat INR per round trip
+  weeklyProfitTarget: num(process.env.WEEKLY_PROFIT_TARGET, 100), // net points per IST week
   // minutes since midnight IST
   sessionStartMin: 9 * 60 + 15,
   lastEntryMin: 15 * 60 + 20,
   eodExitMin: 15 * 60 + 25,
   sessionEndMin: 15 * 60 + 30,
   bandMultiplier: 1,
+  maxReversals: num(process.env.MAX_REVERSALS, 3), // reverse-strategy flips per cycle
 };

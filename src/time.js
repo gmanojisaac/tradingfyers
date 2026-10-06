@@ -8,7 +8,8 @@ const minuteOfDay = (epochSec) => {
   return d.hour * 60 + d.minute;
 };
 const dayKey = (epochSec) => toIst(epochSec).toFormat('yyyy-LL-dd');
+const weekKey = (epochSec) => toIst(epochSec).startOf('week').toFormat('yyyy-LL-dd');
 const fmt = (epochSec) => toIst(epochSec).toFormat('yyyy-LL-dd HH:mm:ss');
 const minuteStart = (epochSec) => Math.floor(epochSec / 60) * 60;
 
-module.exports = { toIst, nowIst, minuteOfDay, dayKey, fmt, minuteStart };
+module.exports = { toIst, nowIst, minuteOfDay, dayKey, weekKey, fmt, minuteStart };

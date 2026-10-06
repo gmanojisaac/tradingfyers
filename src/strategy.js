@@ -4,13 +4,16 @@ const cfg = require('./config');
 
 const isGreen = (c) => c.close > c.open;
 const isRed = (c) => c.close < c.open;
+const SIDES = ['LONG', 'SHORT'];
 
 /**
  * Pure state machine shared by backtest and live modes.
+ * LONG and SHORT run independently: each side has its own setup and position,
+ * so a short can trade while a long is open (and vice versa).
  * Per candle the caller must invoke, in order:
- *   onOpen({ts, open})  -> entry / EOD exit decision at the candle open
- *   onClose(candle)     -> setup detection / signal exit decision at the candle close
- * Actions are returned, never assumed filled: call applyFill() once the order succeeded.
+ *   onOpen({ts, open})  -> array of entry / EOD exit actions at the candle open
+ *   onClose(candle)     -> array of setup / signal exit actions at the candle close
+ * Actions carry their `side`. They are never assumed filled: call applyFill() once the order succeeded.
  * candle: {ts (epoch sec of minute start), open, high, low, close, volume}
  */
 class VwapBandStrategy {
@@ -18,12 +21,16 @@ class VwapBandStrategy {
     this.cfg = { ...cfg, ...options };
     this.vwap = new AnchoredVwap(this.cfg.bandMultiplier);
     this.day = null;
-    this.position = null; // {side:'LONG'|'SHORT', entryPrice, entryTs, triggerOpen, triggerClose}
-    this.pending = null; // {side, triggerOpen, triggerClose, ts}
+    // per side: position {side, entryPrice, entryTs, triggerOpen, triggerClose}, pending {side, triggerOpen, triggerClose, ts}
+    this.state = { LONG: { position: null, pending: null }, SHORT: { position: null, pending: null } };
+  }
+
+  hasPosition() {
+    return SIDES.some((s) => this.state[s].position);
   }
 
   resetMemory() {
-    this.pending = null;
+    SIDES.forEach((s) => (this.state[s].pending = null));
   }
 
   _rollDay(ts) {
@@ -44,67 +51,79 @@ class VwapBandStrategy {
   onOpen({ ts, open }) {
     this._rollDay(ts);
     const m = minuteOfDay(ts);
+    const actions = [];
 
     if (m >= this.cfg.eodExitMin) {
       this.resetMemory();
-      return this.position ? { type: 'EXIT', reason: 'EOD', ts, price: open } : null;
-    }
-    if (this.position || !this.pending) return null;
-
-    if (m < this.cfg.sessionStartMin || m > this.cfg.lastEntryMin) {
-      if (m > this.cfg.lastEntryMin) this.resetMemory();
-      return null;
+      if (this.cfg.holdOvernight) return actions; // multi-day mode: positions carry over, no EOD square-off
+      for (const side of SIDES) {
+        if (this.state[side].position) actions.push({ type: 'EXIT', side, reason: 'EOD', ts, price: open });
+      }
+      return actions;
     }
 
-    const p = this.pending;
-    if (p.side === 'LONG' && open >= p.triggerClose) return { type: 'ENTER', side: 'LONG', ts, price: open };
-    if (p.side === 'SHORT' && open <= p.triggerClose) return { type: 'ENTER', side: 'SHORT', ts, price: open };
-    return null;
+    if (m < this.cfg.sessionStartMin) return actions;
+    if (m > this.cfg.lastEntryMin) {
+      this.resetMemory();
+      return actions;
+    }
+
+    for (const side of SIDES) {
+      const { position, pending: p } = this.state[side];
+      if (position || !p) continue;
+      // the other side's open trade must be at a loss (not in profit) at this open before we add this side
+      const other = this.state[side === 'LONG' ? 'SHORT' : 'LONG'].position;
+      if (other && (other.side === 'LONG' ? open - other.entryPrice : other.entryPrice - open) > 0) continue;
+      if (side === 'LONG' && open >= p.triggerClose) actions.push({ type: 'ENTER', side, ts, price: open });
+      if (side === 'SHORT' && open <= p.triggerClose) actions.push({ type: 'ENTER', side, ts, price: open });
+    }
+    return actions;
   }
 
   onClose(candle) {
     this._rollDay(candle.ts);
     const bands = this.vwap.update(candle);
     const m = minuteOfDay(candle.ts);
-    const pos = this.position;
+    const actions = [];
 
-    if (pos) {
-      if (pos.side === 'LONG' && isRed(candle) && candle.close < pos.triggerOpen) {
-        return { type: 'EXIT', reason: 'SIGNAL', ts: candle.ts, price: candle.close, bands };
-      }
-      if (pos.side === 'SHORT' && isGreen(candle) && candle.close > pos.triggerOpen) {
-        return { type: 'EXIT', reason: 'SIGNAL', ts: candle.ts, price: candle.close, bands };
-      }
-      return null;
+    const long = this.state.LONG.position;
+    const short = this.state.SHORT.position;
+    if (long && isRed(candle) && candle.close < long.triggerOpen) {
+      actions.push({ type: 'EXIT', side: 'LONG', reason: 'SIGNAL', ts: candle.ts, price: candle.close, bands });
+    }
+    if (short && isGreen(candle) && candle.close > short.triggerOpen) {
+      actions.push({ type: 'EXIT', side: 'SHORT', reason: 'SIGNAL', ts: candle.ts, price: candle.close, bands });
     }
 
-    if (!bands || m < this.cfg.sessionStartMin || m > this.cfg.lastEntryMin) return null;
+    if (!bands || m < this.cfg.sessionStartMin || m > this.cfg.lastEntryMin) return actions;
 
+    // candle must open outside the band and close back inside it; a side with an open position takes no new setup
     let side = null;
-    if (isGreen(candle) && candle.low <= bands.lower && candle.high >= bands.lower) side = 'LONG';
-    else if (isRed(candle) && candle.low <= bands.upper && candle.high >= bands.upper) side = 'SHORT';
+    if (isGreen(candle) && candle.open < bands.lower && candle.close > bands.lower) side = 'LONG';
+    // sell: red candle fully below the lower band (upper band is not used for sells)
+    else if (isRed(candle) && candle.open < bands.lower && candle.close < bands.lower) side = 'SHORT';
 
-    if (side) {
-      // a new setup replaces any older one, so only one setup is ever live (opposing setup cancelled)
-      this.pending = { side, triggerOpen: candle.open, triggerClose: candle.close, ts: candle.ts };
-      return { type: 'SETUP', side, ts: candle.ts, triggerOpen: candle.open, triggerClose: candle.close, bands };
+    if (side && !this.state[side].position) {
+      this.state[side].pending = { side, triggerOpen: candle.open, triggerClose: candle.close, ts: candle.ts };
+      actions.push({ type: 'SETUP', side, ts: candle.ts, triggerOpen: candle.open, triggerClose: candle.close, bands });
     }
-    return null;
+    return actions;
   }
 
   applyFill(action, price) {
+    const st = this.state[action.side];
     if (action.type === 'ENTER') {
-      this.position = {
+      st.position = {
         side: action.side,
         entryPrice: price,
         entryTs: action.ts,
-        triggerOpen: this.pending.triggerOpen,
-        triggerClose: this.pending.triggerClose,
+        triggerOpen: st.pending.triggerOpen,
+        triggerClose: st.pending.triggerClose,
       };
-      this.pending = null;
+      st.pending = null;
     } else if (action.type === 'EXIT') {
-      this.position = null;
-      this.resetMemory();
+      st.position = null;
+      st.pending = null;
     }
   }
 }

@@ -8,7 +8,8 @@
     "start": "node index.js",
     "backtest": "node index.js backtest",
     "live": "node index.js live",
-    "login": "node login.js"
+    "login": "node login.js",
+    "chart": "node chart-server.js"
   },
   "keywords": [],
   "author": "",
