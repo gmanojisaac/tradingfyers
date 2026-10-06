@@ -4,11 +4,19 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "test": "node --test test/",
+    "start": "node index.js",
+    "backtest": "node index.js backtest",
+    "live": "node index.js live"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^18.0.5",
+    "fyers-api-v3": "^2.3.0",
+    "luxon": "^3.7.2",
+    "winston": "^3.19.0"
+  }
 }
