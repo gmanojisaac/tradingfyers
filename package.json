@@ -7,7 +7,8 @@
     "test": "node --test test/",
     "start": "node index.js",
     "backtest": "node index.js backtest",
-    "live": "node index.js live"
+    "live": "node index.js live",
+    "login": "node login.js"
   },
   "keywords": [],
   "author": "",
